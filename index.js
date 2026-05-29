@@ -64,6 +64,11 @@ class v160Instance extends InstanceBase {
 			clearInterval(this.INTERVAL)
 			clearInterval(this.RECONNECT_INTERVAL)
 
+			if (this.ackTimer) {
+				clearTimeout(this.ackTimer)
+				this.ackTimer = null
+			}
+
 			this.log('debug', 'destroy')
 		} catch (error) {
 			this.log('error', 'destroy error:' + error)

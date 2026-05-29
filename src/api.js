@@ -4,6 +4,20 @@ module.exports = {
 	initConnection: function () {
 		let self = this
 
+		// Reset the outbound command queue for the new connection.
+		// The device processes commands serially, so we send one at a time and
+		// wait for its reply (or a timeout) before sending the next.
+		self.commandQueueHigh = [] // control commands (button presses) - sent first
+		self.commandQueueLow = [] // state requests (polling) - sent when idle
+		self.awaitingAck = false
+		if (self.ackTimer) {
+			clearTimeout(self.ackTimer)
+			self.ackTimer = null
+		}
+		if (self.ACK_TIMEOUT === undefined) {
+			self.ACK_TIMEOUT = 200 // ms failsafe: advance the queue even if a reply never arrives
+		}
+
 		if (self.socket !== undefined) {
 			self.socket.destroy()
 			delete self.socket
@@ -125,6 +139,13 @@ module.exports = {
 	getData: function () {
 		let self = this
 
+		// Skip this poll cycle if the previous batch of requests hasn't drained yet.
+		// This prevents the queue from piling up faster than the device can answer.
+		if (self.commandQueueLow.length > 0) {
+			self.logVerbose('Skipping poll cycle; previous requests still pending.')
+			return
+		}
+
 		//self.getTallyData();
 		self.getPinpKeyData()
 		self.getAuxData()
@@ -132,7 +153,6 @@ module.exports = {
 		self.getOutputData()
 		self.getAuxLinkData()
 
-		self.getMemoryNames()
 		self.getLastMemoryLoaded()
 	},
 
@@ -227,7 +247,7 @@ module.exports = {
 	subscribeToTally: function () {
 		let self = this
 
-		self.sendRawCommand('DTH:0C0100,01;') //TALLY SEND ACTIVE
+		self.sendRawCommand('DTH:0C0100,01;', 'high') //TALLY SEND ACTIVE
 	},
 
 	updateData: function (data) {
@@ -237,6 +257,10 @@ module.exports = {
 			self.log('debug', data)
 		}
 
+		// Any reply from the device (ACK, ERR, or requested data) means the last
+		// command was received, so we can release the queue and send the next one.
+		self.handleAck()
+
 		if (data.trim() == 'Enter password:') {
 			self.updateStatus(InstanceStatus.Connecting, 'Authenticating')
 			self.log('info', 'Sending passcode: ' + self.config.password)
@@ -244,9 +268,11 @@ module.exports = {
 		} else if (data.trim() == 'Welcome to V-160HD.') {
 			self.updateStatus(InstanceStatus.Ok)
 			self.log('info', 'Authenticated.')
-			self.sendRawCommand('VER') //request version info
-			self.startInterval() //request some states
+			self.sendRawCommand('VER', 'high') //request version info
 			self.subscribeToTally() //request tally changes
+			self.getData() //grab an initial snapshot of dynamic state
+			self.getMemoryNames() //memory names rarely change, so fetch them once here instead of every poll
+			self.startInterval() //start recurring polling of dynamic state (if enabled)
 		} else if (data.trim() == 'ERR:0;') {
 			//an error with something that it received
 		} else {
@@ -538,37 +564,105 @@ module.exports = {
 	sendCommand: function (address, value) {
 		let self = this
 
-		let cmd = 'DTH:' + address + ',' + value + ';\n'
-		self.sendRawCommand(cmd)
+		// Control command from an action/button - send ahead of polling traffic.
+		self.sendRawCommand('DTH:' + address + ',' + value + ';', 'high')
 	},
 
 	requestData: function (command) {
 		let self = this
 
-		let cmd = 'RQH:' + command + ';\n'
-		self.sendRawCommand(cmd)
+		self.sendRawCommand('RQH:' + command + ';', 'low')
 	},
 
-	sendRawCommand: function (command) {
+	sendRawCommand: function (command, priority = 'low') {
 		let self = this
 
-		if (!command.indexOf(';')) {
-			command = command + ';'
+		// Send the command exactly as built by the caller, but guarantee a single
+		// trailing newline (the old code appended a second one when the caller had
+		// already added '\n', which produced a stray blank line on the wire).
+		let cmd = command.toString().replace(/[\r\n]+$/, '')
+		if (cmd.length === 0) {
+			return
 		}
+		cmd = cmd + '\n'
 
-		let cmd = command + '\n'
-
-		if (self.socket !== undefined && self.socket.isConnected) {
-			if (self.config.verbose) {
-				self.log('debug', 'Sending: ' + cmd)
-			}
-
-			self.socket.send(cmd)
-		} else {
+		if (!(self.socket !== undefined && self.socket.isConnected)) {
 			if (self.config.verbose) {
 				self.log('warn', 'Unable to send: Socket not connected.')
 			}
+			return
 		}
+
+		// Queue the command rather than sending immediately. The queue drains one
+		// command at a time as the device acknowledges each one (see processCommandQueue).
+		if (priority === 'high') {
+			self.commandQueueHigh.push(cmd)
+		} else {
+			self.commandQueueLow.push(cmd)
+		}
+
+		self.processCommandQueue()
+	},
+
+	processCommandQueue: function () {
+		let self = this
+
+		// Only one command may be in flight at a time.
+		if (self.awaitingAck) {
+			return
+		}
+
+		if (!(self.socket !== undefined && self.socket.isConnected)) {
+			return
+		}
+
+		// Control commands take priority over polling requests.
+		let cmd
+		if (self.commandQueueHigh.length > 0) {
+			cmd = self.commandQueueHigh.shift()
+		} else if (self.commandQueueLow.length > 0) {
+			cmd = self.commandQueueLow.shift()
+		} else {
+			return
+		}
+
+		if (self.config.verbose) {
+			self.log('debug', 'Sending: ' + cmd)
+		}
+
+		self.awaitingAck = true
+
+		try {
+			self.socket.send(cmd)
+		} catch (error) {
+			if (self.config.verbose) {
+				self.log('warn', 'Send error: ' + error)
+			}
+		}
+
+		// Failsafe: if the device never replies, release the queue anyway so it
+		// can't stall. A real reply (handleAck) will usually release it sooner.
+		self.ackTimer = setTimeout(function () {
+			self.ackTimer = null
+			self.awaitingAck = false
+			self.processCommandQueue()
+		}, self.ACK_TIMEOUT)
+	},
+
+	handleAck: function () {
+		let self = this
+
+		if (!self.awaitingAck) {
+			return
+		}
+
+		if (self.ackTimer) {
+			clearTimeout(self.ackTimer)
+			self.ackTimer = null
+		}
+
+		self.awaitingAck = false
+		self.processCommandQueue()
 	},
 
 	logVerbose: function (message) {
